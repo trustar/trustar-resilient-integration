@@ -1,6 +1,7 @@
 from __future__ import print_function
 from trustar import TruStar, Report
 import logging
+import time
 from circuits.core.handlers import handler
 from resilient_circuits import function, FunctionError, FunctionResult
 from resilient_circuits.actions_component import ResilientComponent
@@ -12,8 +13,11 @@ import base64
 import json
 import validators
 
-LOG = logging.getLogger("trustar_resilient")
+LOG = logging.getLogger(__name__)
 
+# number of seconds to delay between report submit/update and fetching
+# its indicators, to allow Statoin to process.
+REPORT_PROCESSING_TIME = 10
 CONFIG_DATA_SECTION = "trustar"
 
 FIELD_MAPPING = {
@@ -159,28 +163,40 @@ class TruSTARHandler(ResilientComponent):
         :param incident_id: External ID for the report.
         :return: Response Received from the platform.
         """
+
+        if not self.enclave_ids_to_submit:
+            LOG.error("Config file submission enclave IDs not properly "
+                      "configured.")
+            return None
+
         try:
 
-            if self.enclave_ids_to_submit:
-                report = Report(title="Resilient Incident {}: {}".format(incident_id,
-                                                                         self.encode_string(incident_name)), body=data,
-                                enclave_ids=str(self.enclave_ids_to_submit).split(","), external_id="RESILIENT{}".
-                                format(incident_id))
-                response = ts.submit_report(report)
-                for enclave_id in str(self.enclave_ids_to_submit).split(","):
-                    if self.tag:
-                        try:
-                            ts.add_enclave_tag(response.id, self.tag, enclave_id, "internal")
-                        except Exception as e:
-                            LOG.error(e.args[0])
-                            break
-                    else:
-                        LOG.info("TAG name is not configured in config file properly!! Report Submitted without TAG.")
-                        break
-                return response
-            else:
-                LOG.error("Enclave ids are not configured properly.")
-                return None
+            # build report elements.
+            title = ("Resilient Incident {}: {}"
+                     .format(incident_id,
+                             self.encode_string(incident_name)))
+            submit_enclave_ids = [
+                x.strip() for x in str(self.enclave_ids_to_submit).split(",")]
+            external_id = "RESILIENT{}".format(incident_id)
+
+            # build report.
+            report = Report(title=title,
+                            body=data,
+                            enclave_ids=submit_enclave_ids,
+                            external_id=external_id)
+            report = ts.submit_report(report)
+
+
+            if self.tag:
+                # add report tags.
+                for enclave_id in submit_enclave_ids:
+                    try:
+                        ts.add_enclave_tag(report.id, self.tag, enclave_id, "internal")
+                    except Exception as e:
+                        LOG.error(str(e))
+                        continue
+
+            return report
 
         except Exception as e:
             LOG.error(e.args[0])
@@ -314,11 +330,11 @@ class TruSTARHandler(ResilientComponent):
             artifacts = self.rest_client().get(url_for_artifacts)
             LOG.info("Preparing incident data to submit.")
             list_of_tabs = str(self.tabs).lower().split(",")
-            if '' in list_of_tabs:
-                list_of_tabs.remove('')
+            list_of_tabs = [x.strip() for x in list_of_tabs if x]
             incident_data = self.rest_client().get(url)
-            report_body = "Resilient Incident {}: {}\n\n".format(incident_id,
-                                                                 self.encode_string(incident_data['name']))
+            report_body = ("Resilient Incident {}: {}\n\n"
+                           .format(incident_id,
+                                   self.encode_string(incident_data['name'])))
 
             # Filtering notes in case of active incident.
             if incident_data['plan_status'] == "A" and "notes" in list_of_tabs:
@@ -471,19 +487,22 @@ class TruSTARHandler(ResilientComponent):
         :param data: Data to update.
         :return: None
         """
-        try:
 
-            report = ts.get_report_details(str(report_id))
-            report.body = data
-            report.title = "Resilient Incident {}: {}".format(incident_id, self.encode_string(incident_name))
-            report.enclave_ids = str(self.enclave_ids_to_submit).split(",")
-            res = ts.update_report(report)
-            LOG.info("Report Updated Successfully.")
-            return res
+        # try:
 
+        report = ts.get_report_details(str(report_id))
+        report.body = data
+        report.title = "Resilient Incident {}: {}".format(incident_id, self.encode_string(incident_name))
+        report.enclave_ids = str(self.enclave_ids_to_submit).split(",")
+        res = ts.update_report(report)
+        LOG.info("Report Updated Successfully.")
+        return res
+
+        """
         except Exception as e:
             LOG.error(e.args[0])
             return None
+        """
 
     def check_existing_artifacts(self, incident_id, artifact_value):
         """
@@ -547,19 +566,26 @@ class TruSTARHandler(ResilientComponent):
         try:
 
             if extracted_indicators:
+                LOG.info("Source Report's indicators: " + str(extracted_indicators))
                 LOG.info("Getting Correlated Indicators.")
 
                 if self.enclave_ids_for_query:
-                    trustar_corr_indicators = ts.get_related_indicators(extracted_indicators, (str(
+                    gen = ts.get_related_indicators(extracted_indicators, (str(
                         self.enclave_ids_for_query)).split(","))
                 elif self.enclave_ids_to_submit:
-                    trustar_corr_indicators = ts.get_related_indicators(extracted_indicators, str(
+                    gen = ts.get_related_indicators(extracted_indicators, str(
                         self.enclave_ids_to_submit).split(","))
                 else:
                     LOG.error("Enter proper values of enclave ids in config file!!")
                     return None
 
+
+                LOG.info("Generator formed.  Downloading from it now.")
+                trustar_corr_indicators = []
+                for corr_indicator in gen:
+                    trustar_corr_indicators.append(corr_indicator)
                 LOG.info("Correlated Data received successfully.")
+
                 corelated_indicators = []
                 url = "/incidents/{}/artifacts".format(incident_id)
 
@@ -668,26 +694,28 @@ class TruSTARHandler(ResilientComponent):
         :param event: Data received from platform.
         :return: None
         """
-        try:
+        #try:
 
-            incident_id = event.message['incident']['id']
-            incident_name = event.message['incident']['name']
-            report_id = ((ts.get_report_details("RESILIENT{}".format(incident_id), "external")).to_dict())['id']
+        incident_id = event.message['incident']['id']
+        incident_name = event.message['incident']['name']
+        report_id = ((ts.get_report_details("RESILIENT{}".format(incident_id), "external")).to_dict())['id']
 
-            # Filtering indicators in case of active incident.
-            if event.message['incident']['plan_status'] != "C":
-                LOG.info("Fetching Extracted Indicators from TruSTAR.")
-                extracted_indicator = ts.get_indicators_for_report(report_id)
-                extracted_indicators = [data.value for data in extracted_indicator]
-                LOG.info("Received Extracted Indicators successfully!!")
-                res = self.add_artifact_from_indicator(ts, event, extracted_indicators, incident_name, incident_id)
-                return res
-            else:
-                return "Incident is closed"
+        # Filtering indicators in case of active incident.
+        if event.message['incident']['plan_status'] != "C":
+            LOG.info("Fetching Extracted Indicators from TruSTAR.")
+            extracted_indicator = ts.get_indicators_for_report(report_id)
+            extracted_indicators = [data.value for data in extracted_indicator]
+            LOG.info("Received Extracted Indicators successfully!!")
+            res = self.add_artifact_from_indicator(ts, event, extracted_indicators, incident_name, incident_id)
+            return res
+        else:
+            return "Incident is closed"
 
+        """
         except Exception as e:
             LOG.error(e.args[0])
             return None
+        """
 
     def get_workspace_name(self, workspace_id):
         """
@@ -854,52 +882,55 @@ class TruSTARHandler(ResilientComponent):
         :param flag: To check if this function is called from Workflow function or Action Module.
         :return: None
         """
-        try:
+        # try:
 
-            LOG.info("Report Submission for newly created Incident is Started.")
-            incident = event.message['incident']
-            incident_id = incident['id']
-            incident_name = incident['name']
-            incident = self.get_incident_data(incident_id)
+        LOG.info("Report Submission for newly created Incident is Started.")
+        incident = event.message['incident']
+        incident_id = incident['id']
+        incident_name = incident['name']
+        incident = self.get_incident_data(incident_id)
 
-            if incident:
-                LOG.info("Incident data received")
-                response = self.submit_report(ts, incident, incident_id, incident_name)
+        if incident:
+            LOG.info("Incident data received")
+            response = self.submit_report(ts, incident, incident_id, incident_name)
 
-                if response:
-                    LOG.info("Report Submitted Successfully")
-                    url = self.url + "/constellation/reports/{}".format(response.id)
-                    new_note = {
-                        "user_id": {
-                            "id": {},
-                            "name": event.message['incident']['creator']['fname'] + " " + event.message['incident']
-                            ['creator']['lname']
-                        },
-                        "inc_id": incident_id,
-                        "inc_name": incident_name,
-                        "text": {"format": "html",
-                                 "content": "<div><h3>TruSTAR Enrichment</h3><b>TruSTAR Report Submitted Successfully.\
-                                     </b><br /><a href={}>{}</a></div>".format(url, url)}
-                    }
-                    note = self.add_note(incident_id, new_note)
+            if response:
+                LOG.info("Report Submitted Successfully")
+                url = self.url + "/constellation/reports/{}".format(response.id)
+                new_note = {
+                    "user_id": {
+                        "id": {},
+                        "name": event.message['incident']['creator']['fname'] + " " + event.message['incident']
+                        ['creator']['lname']
+                    },
+                    "inc_id": incident_id,
+                    "inc_name": incident_name,
+                    "text": {"format": "html",
+                             "content": "<div><h3>TruSTAR Enrichment</h3><b>TruSTAR Report Submitted Successfully.\
+                                 </b><br /><a href={}>{}</a></div>".format(url, url)}
+                }
+                note = self.add_note(incident_id, new_note)
 
-                    if note:
-                        LOG.info("Note with deeplink created successfully.")
+                if note:
+                    LOG.info("Note with deeplink created successfully.")
 
-                        if flag:
-                            res = self.get_indicators_data(ts, event)
+                    if flag:
+                        time.sleep(REPORT_PROCESSING_TIME)
+                        res = self.get_indicators_data(ts, event)
 
-                            if res:
-                                return response
-                            else:
-                                return None
-
-                        else:
+                        if res:
                             return response
+                        else:
+                            return None
 
+                    else:
+                        return response
+
+        """
         except Exception as e:
             LOG.error(e.args[0])
             return None
+        """
 
     @handler("casecreated")
     def incident_creation(self, event, *args, **kwargs):
@@ -961,12 +992,76 @@ class TruSTARHandler(ResilientComponent):
     @handler("send_to_trustar")
     def get_reports(self, event, *args, **kwargs):
         """
-        This function will be executed when Get Reports menu item rule will be triggered. This will then fetch report
+        This function will be executed when Get Reports menu item rule will be
+        triggered. This will then fetch report
         from the trustar and the response will be added as note in incident.
         :param event: Data Received from the platform.
         :param args: Arguments received from resilient platform
         :param kwargs: Arguments received from resilient platform
         :return: Yield status to platform.
+        """
+        create = 'create'
+        update = 'update'
+
+        workspace_name = event.message['incident']['workspace']
+        ts = self.get_ts(workspace_name)
+
+        try:
+            report = ts.get_report_details(
+                "RESILIENT{}".format(event.message['incident']['id']),
+                "external")
+            operation = update
+        except requests.HTTPError as e:
+            report = None
+            if e.response.status_code == 404:
+                operation = create
+            else:
+                LOG.error(str(e))
+                yield "'send_to_trustar' / get_reports() failed."
+
+        status = "Task wasn't completed!!"
+
+        if operation == update:
+            LOG.info("Report Update Started!!")
+            data = self.get_incident_data(event.message['incident']['id'])
+            if data:
+                response = self.update_report(
+                    ts, report.id, data, event.message['incident']['id'],
+                    event.message['incident']['name'])
+                time.sleep(10)
+                res = self.get_indicators_data(ts, event)
+                if res:
+                    status = "Task Completed Successfully!!"
+                else:
+                    status = "Task wasn't completed!!"
+
+        elif operation == create:
+            url_for_type = "/types/incident/fields/incident_type_ids"
+            types = self.rest_client().get(url_for_type)
+            incident_types = types['values']
+            types_to_exclude = [i_type['value'] for i_type in incident_types if
+                                i_type['label'] in self.types]
+            flag = True
+
+            for i_type in types_to_exclude:
+
+                if i_type in event.message['incident']['incident_type_ids']:
+                    LOG.error(
+                        "This type of incident can't be submitted to TruSTAR")
+                    flag = False
+                    break
+
+            if flag:
+                LOG.info("Submit Report Started.")
+                response = self.create_report(ts, event, True)
+
+                if response:
+                    status = "Task Completed Successfully"
+                else:
+                    status = "Task wasn't completed!!"
+        yield status
+
+
         """
         try:
 
@@ -1037,7 +1132,7 @@ class TruSTARHandler(ResilientComponent):
         except Exception as e:
             LOG.error(e.args[0])
             yield "Task wasn't completed"
-
+        """
     @handler("updateincident", "artifactcreated")
     def update_incident(self, event, *args, **kwargs):
         """
@@ -1068,6 +1163,7 @@ class TruSTARHandler(ResilientComponent):
                                                  event.message['incident']['name'])
 
                         if res:
+                            time.sleep(10)
                             response = self.get_indicators_data(ts, event)
 
                             if response:
