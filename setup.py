@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 
-PUBLISH_VERSION = "1.2.0"
+PUBLISH_VERSION = "1.3.0"
 
 
 setup(
@@ -12,12 +12,12 @@ setup(
     description="Resilient Circuits Components for TruSTAR",
     long_description="Resilient Circuits Components for TruSTAR",
     install_requires=[
-        'resilient_circuits>=30.0.0',
+        'resilient_circuits>=37.0.214',
         'trustar',
         'watchdog',
         'validators',
         'requests',
-        'circuits'
+        'typing'
     ],
     packages=find_packages(),
     include_package_data=True,
