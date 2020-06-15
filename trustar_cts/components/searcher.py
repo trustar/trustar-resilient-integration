@@ -152,9 +152,11 @@ class TruSTARThreatSearcher(BaseComponent):
 
         if not isinstance(event, ThreatServiceLookupEvent):
             return None
-        else:
-            LOG.error('YAY!')
+
+
         artifact_value = event.artifact['value'].strip()
+        LOG.info("Threat Lookup started for artifact: '{}'"
+                .format(artifact_value))
         if not artifact_value:
             LOG.error("No artifact found in ThreatServiceLookupEvent.")
             return None
@@ -173,8 +175,7 @@ class TruSTARThreatSearcher(BaseComponent):
             return msg
 
     def _lookup_string_artifact(self, artifact_value):
-        LOG.info("Threat Lookup started for artifact: '{}'"
-                 .format(artifact_value))
+
 
         now_millis = int(time.time() * 1000.0)
         n_millis_in_a_day = 24 * 60 * 60 * 1000
