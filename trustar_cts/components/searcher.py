@@ -6,6 +6,8 @@ from __future__ import unicode_literals
 import logging
 import time
 import sys
+import os
+from collections import defaultdict
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -32,6 +34,7 @@ CLIENT_METATAG = "RESILIENT_CUSTOM_THREAT_SOURCE"
 class TruSTARThreatSearcher(BaseComponent):
     """ Custom threat lookup for TruSTAR. """
 
+    hits = {}
     channel = searcher_channel("trustar_cts")
 
     def __init__(self, opts,                                # type: ConfigDict
@@ -56,12 +59,12 @@ class TruSTARThreatSearcher(BaseComponent):
             self._log_raise(msg)
 
 
-
         # Client Config Dict.
-        trustar_client_config = {"user_api_key": user_api_key,
-                                 "user_api_secret": user_api_secret,
-                                 "client_metatag": CLIENT_METATAG}
-
+        self.trustar_client_config = {"user_api_key": user_api_key,
+                                      "user_api_secret": user_api_secret,
+                                      "client_metatag": CLIENT_METATAG,
+                                      "max_wait_time": 180,
+                                      "max_retries": 20}
 
 
         # "trustar" stanza.
@@ -86,14 +89,11 @@ class TruSTARThreatSearcher(BaseComponent):
                 raise Exception("Problem with proxy settings in config file."
                                 "Please fix them and try again.")
 
-            trustar_client_config['http_proxy'] = proxy_data['http_proxy']
-            trustar_client_config['https_proxy'] = proxy_data['https_proxy']
-
-
-
+            self.trustar_client_config['http_proxy'] = proxy_data['http_proxy']
+            self.trustar_client_config['https_proxy'] = proxy_data['https_proxy']
 
         # Client.
-        self.ts = TruStar(config=trustar_client_config)
+        ts = TruStar(config=self.trustar_client_config)
 
         self.search_enclave_ids = [x.strip() for x in
                                    enclave_ids.split(",")]
@@ -102,7 +102,7 @@ class TruSTARThreatSearcher(BaseComponent):
 
 
         # Enclave validation.
-        this_users_enclaves = self.ts.get_user_enclaves()   # type: List[EnclavePermissions]
+        this_users_enclaves = ts.get_user_enclaves()   # type: List[EnclavePermissions]
 
         self.enclave_names = {}
         for enclave in this_users_enclaves:         # type: EnclavePermissions
@@ -153,10 +153,17 @@ class TruSTARThreatSearcher(BaseComponent):
         if not isinstance(event, ThreatServiceLookupEvent):
             return None
 
+        self.ts = TruStar(config=self.trustar_client_config)   # type: TruStar
+        self.ts._client.logger = LOG
+        LOG.setLevel(logging.DEBUG)
+        process_id = os.getpid()
+
 
         artifact_value = event.artifact['value'].strip()
-        LOG.info("Threat Lookup started for artifact: '{}'"
-                .format(artifact_value))
+        LOG.info("Threat Lookup started for artifact: '{}', request ID '{}', "
+                 "UID '{}', Process '{}'."
+                 .format(artifact_value, event.request_id, event.uid,
+                         process_id))
         if not artifact_value:
             LOG.error("No artifact found in ThreatServiceLookupEvent.")
             return None
@@ -227,13 +234,22 @@ class TruSTARThreatSearcher(BaseComponent):
             report_hits = self.get_report_hits(indicator_value)  # type: List[Hit]
         except Exception as e:
             report_hits = []
-            raise Exception("Buildint report hits for '{}' failed.  "
+            raise Exception("Building report hits for '{}' failed.  "
                             "Exception message:  '{}'."
                             .format(artifact_value, str(e)))
 
         hits = []                                            # type: List[Hit]
         hits.extend(summary_hits)
         hits.extend(report_hits)
+
+        TruSTARThreatSearcher.hits[artifact_value] = hits
+        LOG.info("Artifacts with hits: {}".format(str(
+            TruSTARThreatSearcher.hits.keys())))
+        try:
+            print(TruSTARThreatSearcher.hits)
+        except:
+            pass
+
         return hits
 
 
@@ -319,6 +335,7 @@ class TruSTARThreatSearcher(BaseComponent):
         )                                  # type: Generator[IndicatorSummary]
 
         summaries = []                          # type: List[IndicatorSummary]
+
         for summary in gen:
             if summary:
                 summaries.append(summary)
